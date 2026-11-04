@@ -42,20 +42,26 @@ SERVER_URL = (
 PORT = int(os.getenv("PORT", 10000))
 
 ADD_GROUP_URL = "https://t.me/Smart_Nsfw_Detector_Bot?startgroup=true"
-MAX_FILE_SIZE = 8 * 1024 * 1024  # 8 MB
-NSFW_THRESHOLD = 0.80            # 80% score threshold
-TARGET_DIMENSION = 320           # 320x320 compressed & padded size
-SCAN_FPS = 2                     # 2 FPS for videos/GIFs/live stickers
-CACHE_MAX_ITEMS = 2000           # Cache size for repeated stickers/GIFs
+MAX_FILE_SIZE = 8 * 1024 * 1024  # 8 MB limit
+TARGET_DIMENSION = 320           # 320x320 compressed & padded canvas
+MAX_VIDEO_FRAMES = 10            # Max 10 frames per video at constant time gaps
+LIVE_STICKER_FPS = 1             # 1 FPS sampling for live stickers
+CACHE_MAX_ITEMS = 2500           # In-memory cache for repeated media
 
-NSFW_TARGET_LABELS = {
-    "FEMALE_GENITALIA_EXPOSED",
-    "MALE_GENITALIA_EXPOSED",
-    "FEMALE_BREAST_EXPOSED",
-    "BUTTOCKS_EXPOSED",
-    "ANUS_EXPOSED",
-    "FEMALE_GENITALIA_COVERED",
-    "ANUS_COVERED",
+# Per-class sensitivity thresholds (triggers deletion when score >= class limit)
+CLASS_THRESHOLDS = {
+    # Primary Explicit Classes (Strict Limits)
+    "FEMALE_GENITALIA_EXPOSED": 0.55,
+    "MALE_GENITALIA_EXPOSED": 0.55,
+    "ANUS_EXPOSED": 0.55,
+    "FEMALE_BREAST_EXPOSED": 0.60,
+    "BUTTOCKS_EXPOSED": 0.65,
+    # Additional Explicit & Borderline NSFW Classes (Balanced Limits)
+    "MALE_BREAST_EXPOSED": 0.72,
+    "FEMALE_GENITALIA_COVERED": 0.70,
+    "ANUS_COVERED": 0.70,
+    "FEMALE_BREAST_COVERED": 0.78,
+    "BUTTOCKS_COVERED": 0.78,
 }
 
 if not BOT_TOKEN:
@@ -63,38 +69,37 @@ if not BOT_TOKEN:
     sys.exit(1)
 
 # ==================== DETECTOR, QUEUES & CACHE ====================
-# Single-worker executor guarantees strictly one-by-one synchronous scanning
+# Single-worker thread pool ensures strictly one-by-one synchronous model execution
 detector = NudeDetector()
 scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="SingleScanner")
 
-# Separate webhook & scan queues so webhook returns 200 OK instantaneously
 webhook_raw_queue: asyncio.Queue = asyncio.Queue()
 scan_queue: asyncio.Queue = asyncio.Queue()
-download_semaphore = asyncio.Semaphore(3)  # Pre-fetch up to 3 files ahead
+download_semaphore = asyncio.Semaphore(3)
 
-# LRU Cache: {file_unique_id: max_score} to skip re-scanning repeated stickers/GIFs
-score_cache: OrderedDict[str, float] = OrderedDict()
+# LRU Cache: {file_unique_id: is_nsfw_bool}
+result_cache: OrderedDict[str, bool] = OrderedDict()
 
 
-def get_cached_score(unique_id: str) -> float | None:
-    if not unique_id or unique_id not in score_cache:
+def get_cached_result(unique_id: str) -> bool | None:
+    if not unique_id or unique_id not in result_cache:
         return None
-    score_cache.move_to_end(unique_id)
-    return score_cache[unique_id]
+    result_cache.move_to_end(unique_id)
+    return result_cache[unique_id]
 
 
-def set_cached_score(unique_id: str, score: float) -> None:
+def set_cached_result(unique_id: str, is_nsfw: bool) -> None:
     if not unique_id:
         return
-    score_cache[unique_id] = score
-    score_cache.move_to_end(unique_id)
-    if len(score_cache) > CACHE_MAX_ITEMS:
-        score_cache.popitem(last=False)
+    result_cache[unique_id] = is_nsfw
+    result_cache.move_to_end(unique_id)
+    if len(result_cache) > CACHE_MAX_ITEMS:
+        result_cache.popitem(last=False)
 
 
 # ==================== BLUE BUTTON HELPER ====================
 def get_add_to_group_markup() -> InlineKeyboardMarkup:
-    """Returns a solid blue Telegram button redirecting to the group add link."""
+    """Creates a solid blue Telegram button redirecting to the group add URL."""
     try:
         button = InlineKeyboardButton(
             text="➕ Add to Your Group",
@@ -110,21 +115,42 @@ def get_add_to_group_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[button]])
 
 
-# ==================== IMAGE & VIDEO PROCESSING ====================
+# ==================== IMAGE & FRAME PREPROCESSING ====================
+def normalize_channels(img: np.ndarray) -> np.ndarray:
+    """Handles RGBA/BGRA transparency (common in stickers) and grayscale images."""
+    if img is None or img.size == 0:
+        return np.zeros((TARGET_DIMENSION, TARGET_DIMENSION, 3), dtype=np.uint8)
+
+    if len(img.shape) == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    if len(img.shape) == 3 and img.shape[2] == 4:
+        alpha = (img[:, :, 3].astype(np.float32)) / 255.0
+        bgr = img[:, :, :3].astype(np.float32)
+        bg = np.full_like(bgr, 240.0)  # Neutral light background for transparent stickers
+        composited = bgr * alpha[:, :, np.newaxis] + bg * (1.0 - alpha[:, :, np.newaxis])
+        return composited.astype(np.uint8)
+
+    return img[:, :, :3]
+
+
 def compress_and_pad_frame(frame: np.ndarray, target_size: int = TARGET_DIMENSION) -> np.ndarray:
-    """Compresses frame into a padded 320x320 square canvas."""
-    if frame is None or frame.size == 0:
+    """
+    Compresses the frame and adds uniform border padding to fit a 320x320 canvas.
+    Preserves aspect ratio and keeps edge features clearly visible for detection.
+    """
+    clean_frame = normalize_channels(frame)
+    h, w = clean_frame.shape[:2]
+    if h == 0 or w == 0:
         return np.zeros((target_size, target_size, 3), dtype=np.uint8)
 
-    inner_size = int(target_size * 0.85)
-    h, w = frame.shape[:2]
-
+    inner_size = int(target_size * 0.88)
     scale = min(inner_size / max(w, 1), inner_size / max(h, 1))
     new_w = max(1, int(round(w * scale)))
     new_h = max(1, int(round(h * scale)))
 
     interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-    resized = cv2.resize(frame, (new_w, new_h), interpolation=interp)
+    resized = cv2.resize(clean_frame, (new_w, new_h), interpolation=interp)
 
     pad_top = (target_size - new_h) // 2
     pad_bottom = target_size - new_h - pad_top
@@ -138,86 +164,183 @@ def compress_and_pad_frame(frame: np.ndarray, target_size: int = TARGET_DIMENSIO
         pad_left,
         pad_right,
         borderType=cv2.BORDER_CONSTANT,
-        value=[0, 0, 0],
+        value=[114, 114, 114],  # Neutral padding color for best detection accuracy
     )
 
 
-def evaluate_frame_sync(frame: np.ndarray) -> float:
-    """Runs synchronous detection on a single padded 320x320 frame."""
+def is_frame_nsfw_sync(frame: np.ndarray) -> tuple[bool, str, float]:
+    """
+    Evaluates a single padded 320x320 frame against CLASS_THRESHOLDS.
+    Returns (is_nsfw, matched_class, matched_score).
+    """
     padded = compress_and_pad_frame(frame, TARGET_DIMENSION)
     detections = detector.detect(padded)
 
-    max_score = 0.0
     for item in detections:
-        if item.get("class") in NSFW_TARGET_LABELS:
-            score = float(item.get("score", 0.0))
-            if score > max_score:
-                max_score = score
-    return max_score
+        label = item.get("class", "")
+        score = float(item.get("score", 0.0))
+        threshold = CLASS_THRESHOLDS.get(label)
+        if threshold is not None and score >= threshold:
+            return True, label, score
+
+    return False, "", 0.0
 
 
-def scan_media_sync(file_path: str, is_video_or_anim: bool) -> float:
+# ==================== MEDIA SCANNERS (STATIC / LIVE STICKER / VIDEO) ====================
+def scan_live_sticker_sync(file_path: str) -> bool:
     """
-    Runs strictly one-by-one inside the single worker thread.
-    - Static images/stickers: compressed & padded to 320x320.
-    - Live stickers/GIFs/videos: sampled at 2 FPS, compressed & padded to 320x320,
-      and stops immediately as soon as any frame hits 80%+.
+    Dedicated scanner for Live Video Stickers (.webm) at 1 FPS.
+    Decodes all frames reliably (ignoring broken WebM header metadata) and samples
+    at 1-second intervals plus key boundary frames (start, middle, end).
     """
-    if not is_video_or_anim:
-        img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
-        if img is not None:
-            if len(img.shape) == 3 and img.shape[2] == 4:
-                alpha = img[:, :, 3] / 255.0
-                bgr = img[:, :, :3]
-                bg = np.full_like(bgr, 255, dtype=np.uint8)
-                img = (bgr * alpha[:, :, np.newaxis] + bg * (1 - alpha[:, :, np.newaxis])).astype(np.uint8)
-            elif len(img.shape) == 2:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            return evaluate_frame_sync(img)
-
     cap = cv2.VideoCapture(file_path)
     if not cap.isOpened():
-        return 0.0
+        return False
 
-    native_fps = cap.get(cv2.CAP_PROP_FPS)
-    if not native_fps or math.isnan(native_fps) or native_fps <= 0 or native_fps > 120:
-        native_fps = 30.0
-
-    frame_step = max(1, int(round(native_fps / SCAN_FPS)))
-    frame_idx = 0
-    highest_score = 0.0
+    frames: list[np.ndarray] = []
+    timestamps_ms: list[float] = []
 
     try:
         while True:
             ret, frame = cap.read()
-            if not ret:
+            if not ret or frame is None:
                 break
-
-            if frame_idx % frame_step == 0:
-                score = evaluate_frame_sync(frame)
-                if score > highest_score:
-                    highest_score = score
-                if highest_score >= NSFW_THRESHOLD:
-                    break  # Instant early exit on NSFW detection
-
-            frame_idx += 1
+            frames.append(frame)
+            timestamps_ms.append(cap.get(cv2.CAP_PROP_POS_MSEC))
     finally:
         cap.release()
 
-    return highest_score
+    total = len(frames)
+    if total == 0:
+        return False
+
+    # Select frames at 1 FPS (every 1000ms)
+    indices_to_scan: list[int] = [0]
+    last_sampled_ms = timestamps_ms[0] if timestamps_ms[0] >= 0 else 0.0
+    interval_ms = 1000.0 / LIVE_STICKER_FPS  # 1000ms for 1 FPS
+
+    for idx in range(1, total):
+        cur_ms = timestamps_ms[idx]
+        if cur_ms > 0 and (cur_ms - last_sampled_ms) >= interval_ms:
+            indices_to_scan.append(idx)
+            last_sampled_ms = cur_ms
+
+    # Fallback if container timestamps were missing or 0 (assume standard ~30fps live sticker)
+    if len(indices_to_scan) == 1 and total > 1:
+        step = max(1, int(round(30 / LIVE_STICKER_FPS)))
+        indices_to_scan = list(range(0, total, step))
+
+    # Always include middle and last frame so short bait stickers cannot bypass 1 FPS
+    for extra_idx in (total // 3, (2 * total) // 3, total - 1):
+        if 0 <= extra_idx < total and extra_idx not in indices_to_scan:
+            indices_to_scan.append(extra_idx)
+
+    for idx in sorted(set(indices_to_scan)):
+        flagged, label, score = is_frame_nsfw_sync(frames[idx])
+        if flagged:
+            logger.info(f"Live sticker flagged on frame {idx + 1}/{total}: {label} ({score:.2f})")
+            return True
+
+    return False
+
+
+def scan_video_10_frames_sync(file_path: str) -> bool:
+    """
+    Scans any video or GIF by extracting at most 10 frames at a constant time gap
+    across the entire video duration. Exits early as soon as NSFW is detected.
+    """
+    cap = cv2.VideoCapture(file_path)
+    if not cap.isOpened():
+        return False
+
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Path A: Reliable frame count known -> seek across 10 constant-gap positions
+        if total_frames > 0:
+            num_samples = min(MAX_VIDEO_FRAMES, total_frames)
+            target_indices = np.linspace(0, total_frames - 1, num=num_samples, dtype=int)
+            last_idx = -1
+
+            for idx in target_indices:
+                idx_int = int(idx)
+                if idx_int == last_idx:
+                    continue
+                last_idx = idx_int
+
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx_int)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    continue
+
+                flagged, label, score = is_frame_nsfw_sync(frame)
+                if flagged:
+                    logger.info(
+                        f"Video flagged at frame {idx_int + 1}/{total_frames}: {label} ({score:.2f})"
+                    )
+                    return True
+            return False
+
+        # Path B: Fallback when container doesn't report total_frames
+        all_frames: list[np.ndarray] = []
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+            all_frames.append(frame)
+
+        total_read = len(all_frames)
+        if total_read == 0:
+            return False
+
+        num_samples = min(MAX_VIDEO_FRAMES, total_read)
+        target_indices = np.linspace(0, total_read - 1, num=num_samples, dtype=int)
+
+        for idx in sorted(set(int(i) for i in target_indices)):
+            flagged, label, score = is_frame_nsfw_sync(all_frames[idx])
+            if flagged:
+                logger.info(f"Video flagged at frame {idx + 1}/{total_read}: {label} ({score:.2f})")
+                return True
+
+        return False
+    finally:
+        cap.release()
+
+
+def scan_media_sync(file_path: str, media_kind: str) -> bool:
+    """
+    Main synchronous entry point executed strictly one-by-one in the worker thread.
+    media_kind: "image" | "live_sticker" | "video"
+    """
+    if media_kind == "live_sticker":
+        return scan_live_sticker_sync(file_path)
+
+    if media_kind == "video":
+        return scan_video_10_frames_sync(file_path)
+
+    # Static image or static sticker (.jpg, .png, .webp)
+    img = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        # Fallback if a sticker or image requires VideoCapture decoding
+        return scan_live_sticker_sync(file_path)
+
+    flagged, label, score = is_frame_nsfw_sync(img)
+    if flagged:
+        logger.info(f"Image flagged: {label} ({score:.2f})")
+    return flagged
 
 
 # ==================== TELEGRAM HANDLERS ====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a clean, concise /start response with the blue Add to Group button."""
+    """Handles /start with a concise English message and blue Add to Group button."""
     if not update.effective_message:
         return
 
     text = (
         "🛡️ <b>Smart NSFW Detector Bot</b>\n\n"
         "<blockquote>I'm an advanced NSFW detector bot. I can delete NSFW content "
-        "from your GC to keep your chat clean and safe.</blockquote>\n\n"
-        "📌 <i>Add me to your group with <b>Delete Messages</b> admin permission.</i>"
+        "from your GC to keep your community clean and safe.</blockquote>\n\n"
+        "📌 <i>Add me to your group and grant <b>Delete Messages</b> admin permission.</i>"
     )
 
     await update.effective_message.reply_text(
@@ -227,58 +350,71 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
-def extract_media_info(message) -> tuple[str | None, str | None, int, bool, str]:
-    """Returns (file_id, file_unique_id, file_size, is_video_or_anim, suffix)."""
+def extract_media_info(message) -> tuple[str | None, str | None, int, str, str]:
+    """
+    Extracts (file_id, file_unique_id, file_size, media_kind, suffix).
+    media_kind is one of: "image", "live_sticker", "video", or "".
+    """
+    # 1. Stickers (Static .webp, Live Video .webm, Animated .tgs)
     if message.sticker:
         st = message.sticker
         if st.is_video:
-            return st.file_id, st.file_unique_id, st.file_size or 0, True, ".webm"
+            return st.file_id, st.file_unique_id, st.file_size or 0, "live_sticker", ".webm"
         if st.is_animated:
+            # Animated .tgs stickers: check embedded thumbnail
             if st.thumbnail:
                 return (
                     st.thumbnail.file_id,
                     st.file_unique_id,
                     st.thumbnail.file_size or 0,
-                    False,
+                    "image",
                     ".webp",
                 )
-            return None, None, 0, False, ""
-        return st.file_id, st.file_unique_id, st.file_size or 0, False, ".webp"
+            return None, None, 0, "", ""
+        return st.file_id, st.file_unique_id, st.file_size or 0, "image", ".webp"
 
+    # 2. GIFs / Animations
     if message.animation:
         anim = message.animation
-        return anim.file_id, anim.file_unique_id, anim.file_size or 0, True, ".mp4"
+        return anim.file_id, anim.file_unique_id, anim.file_size or 0, "video", ".mp4"
 
+    # 3. Photos
     if message.photo:
         p = message.photo[-1]
-        return p.file_id, p.file_unique_id, p.file_size or 0, False, ".jpg"
+        return p.file_id, p.file_unique_id, p.file_size or 0, "image", ".jpg"
 
+    # 4. Videos
     if message.video:
         v = message.video
-        return v.file_id, v.file_unique_id, v.file_size or 0, True, ".mp4"
+        return v.file_id, v.file_unique_id, v.file_size or 0, "video", ".mp4"
 
+    # 5. Video Notes
     if message.video_note:
         vn = message.video_note
-        return vn.file_id, vn.file_unique_id, vn.file_size or 0, True, ".mp4"
+        return vn.file_id, vn.file_unique_id, vn.file_size or 0, "video", ".mp4"
 
+    # 6. Documents (uncompressed images, GIFs, WebM, videos)
     if message.document:
         doc = message.document
         mime = (doc.mime_type or "").lower()
+        if "webm" in mime:
+            return doc.file_id, doc.file_unique_id, doc.file_size or 0, "live_sticker", ".webm"
         if mime.startswith("image/"):
-            is_gif = "gif" in mime
-            return doc.file_id, doc.file_unique_id, doc.file_size or 0, is_gif, ".gif" if is_gif else ".jpg"
+            if "gif" in mime:
+                return doc.file_id, doc.file_unique_id, doc.file_size or 0, "video", ".gif"
+            return doc.file_id, doc.file_unique_id, doc.file_size or 0, "image", ".jpg"
         if mime.startswith("video/"):
-            return doc.file_id, doc.file_unique_id, doc.file_size or 0, True, ".mp4"
+            return doc.file_id, doc.file_unique_id, doc.file_size or 0, "video", ".mp4"
 
-    return None, None, 0, False, ""
+    return None, None, 0, "", ""
 
 
 async def delete_and_notify(bot, chat_id: int, message_id: int, user_mention: str) -> None:
-    """Deletes the NSFW message and sends a short formatted alert with the blue button."""
+    """Deletes the flagged message and posts a formatted alert with the blue button."""
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception as e:
-        logger.warning(f"Delete failed in {chat_id} for msg {message_id}: {e}")
+        logger.warning(f"Could not delete msg {message_id} in {chat_id}: {e}")
         return
 
     alert_text = (
@@ -294,14 +430,14 @@ async def delete_and_notify(bot, chat_id: int, message_id: int, user_mention: st
             reply_markup=get_add_to_group_markup(),
         )
     except Exception as e:
-        logger.warning(f"Failed to send deletion notice in {chat_id}: {e}")
+        logger.warning(f"Failed to send alert in {chat_id}: {e}")
 
 
 async def send_size_limit_reply(bot, chat_id: int, message_id: int) -> None:
-    """Replies with a short formatted notice when media exceeds 8 MB."""
+    """Replies when a file is larger than 8 MB."""
     limit_text = (
         "⚠️ <b>File Limit Exceeded</b>\n\n"
-        "<blockquote>This file is larger than my <b>8 MB</b> limit, so I cannot process it.</blockquote>"
+        "<blockquote>This file exceeds my <b>8 MB</b> limit, so I cannot process it.</blockquote>"
     )
     try:
         await bot.send_message(
@@ -311,14 +447,11 @@ async def send_size_limit_reply(bot, chat_id: int, message_id: int) -> None:
             parse_mode=ParseMode.HTML,
         )
     except Exception as e:
-        logger.warning(f"Failed to send size limit notice in {chat_id}: {e}")
+        logger.warning(f"Failed to send limit notice in {chat_id}: {e}")
 
 
 async def prefetch_and_enqueue(bot, job: dict) -> None:
-    """
-    Downloads the media file in the background (up to 3 concurrent downloads)
-    and pushes the ready local file to the sequential scan queue so the scanner never waits.
-    """
+    """Pre-downloads media in the background and queues it for one-by-one scanning."""
     async with download_semaphore:
         temp_path = None
         try:
@@ -334,7 +467,7 @@ async def prefetch_and_enqueue(bot, job: dict) -> None:
             job["temp_path"] = temp_path
             await scan_queue.put(job)
         except Exception as e:
-            logger.error(f"Download failed for {job['file_id']}: {e}")
+            logger.error(f"Download error for {job['file_id']}: {e}")
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
@@ -343,14 +476,14 @@ async def prefetch_and_enqueue(bot, job: dict) -> None:
 
 
 async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles new and edited media messages with instant cache lookup and 8 MB check."""
+    """Validates media size, checks instant cache, or queues for sequential scan."""
     message = update.effective_message
     chat = update.effective_chat
     if not message or not chat:
         return
 
-    file_id, unique_id, file_size, is_video_or_anim, suffix = extract_media_info(message)
-    if not file_id:
+    file_id, unique_id, file_size, media_kind, suffix = extract_media_info(message)
+    if not file_id or not media_kind:
         return
 
     if file_size > MAX_FILE_SIZE:
@@ -361,21 +494,20 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
         message.from_user.mention_html() if message.from_user else "<b>User</b>"
     )
 
-    # 1. Check cache first (instant action for repeated stickers/GIFs)
-    cached_score = get_cached_score(unique_id)
-    if cached_score is not None:
-        if cached_score >= NSFW_THRESHOLD:
+    # Check cache first for instant action on repeated stickers/GIFs
+    cached_flag = get_cached_result(unique_id)
+    if cached_flag is not None:
+        if cached_flag:
             await delete_and_notify(context.bot, chat.id, message.message_id, user_mention)
         return
 
-    # 2. Pre-fetch download and queue for sequential one-by-one scanning
     job = {
         "chat_id": chat.id,
         "message_id": message.message_id,
         "user_mention": user_mention,
         "file_id": file_id,
         "unique_id": unique_id,
-        "is_video_or_anim": is_video_or_anim,
+        "media_kind": media_kind,
         "suffix": suffix,
     }
     asyncio.create_task(prefetch_and_enqueue(context.bot, job))
@@ -383,7 +515,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ==================== BACKGROUND WORKERS ====================
 async def webhook_processor_worker(bot_app: Application) -> None:
-    """Processes raw webhook updates pulled from the instant memory queue."""
+    """Consumes raw webhook payloads from memory so /webhook responds in <1ms."""
     while True:
         raw_bytes = await webhook_raw_queue.get()
         try:
@@ -394,33 +526,32 @@ async def webhook_processor_worker(bot_app: Application) -> None:
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Webhook parse error: {e}")
+            logger.error(f"Webhook worker error: {e}")
         finally:
             webhook_raw_queue.task_done()
 
 
 async def sequential_scan_worker(bot_app: Application) -> None:
-    """Scans pre-downloaded files strictly one-by-one in the dedicated single thread."""
+    """Executes NudeNet scans strictly one-by-one in the dedicated single thread."""
     loop = asyncio.get_running_loop()
 
     while True:
         job = await scan_queue.get()
         temp_path = job.get("temp_path")
         try:
-            # Double-check cache in case an identical sticker finished moments ago
-            cached = get_cached_score(job["unique_id"])
+            cached = get_cached_result(job["unique_id"])
             if cached is not None:
-                score = cached
+                is_nsfw = cached
             else:
-                score = await loop.run_in_executor(
+                is_nsfw = await loop.run_in_executor(
                     scan_executor,
                     scan_media_sync,
                     temp_path,
-                    job["is_video_or_anim"],
+                    job["media_kind"],
                 )
-                set_cached_score(job["unique_id"], score)
+                set_cached_result(job["unique_id"], is_nsfw)
 
-            if score >= NSFW_THRESHOLD:
+            if is_nsfw:
                 await delete_and_notify(
                     bot_app.bot,
                     job["chat_id"],
@@ -430,7 +561,7 @@ async def sequential_scan_worker(bot_app: Application) -> None:
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Scan worker error: {e}")
+            logger.error(f"Sequential scan worker error: {e}")
         finally:
             if temp_path and os.path.exists(temp_path):
                 try:
@@ -441,7 +572,7 @@ async def sequential_scan_worker(bot_app: Application) -> None:
 
 
 async def self_ping_loop() -> None:
-    """Pings the server every 30 seconds to keep the Render instance awake."""
+    """Pings the server URL every 30 seconds to prevent Render spin-down."""
     if not SERVER_URL:
         return
 
@@ -487,7 +618,7 @@ async def lifespan(app: FastAPI):
             drop_pending_updates=True,
             allowed_updates=["message", "edited_message"],
         )
-        logger.info(f"Webhook set to: {webhook_url}")
+        logger.info(f"Webhook active at: {webhook_url}")
 
     webhook_task = asyncio.create_task(webhook_processor_worker(ptb_app))
     scan_task = asyncio.create_task(sequential_scan_worker(ptb_app))
@@ -514,7 +645,7 @@ async def health_check():
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    """Immediately pushes raw bytes into memory and returns 200 OK in <1ms."""
+    """Instantly queues raw webhook bytes and returns 200 OK without waiting."""
     body = await request.body()
     if body:
         webhook_raw_queue.put_nowait(body)
