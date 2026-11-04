@@ -51,18 +51,19 @@ CACHE_MAX_ITEMS = 2500           # In-memory cache for repeated media
 # Per-class sensitivity thresholds (triggers deletion when score >= class limit)
 CLASS_THRESHOLDS = {
     # Primary Explicit Classes (Strict Limits)
-    "FEMALE_GENITALIA_EXPOSED": 0.55,
+    "FEMALE_GENITALIA_EXPOSED": 0.50,
     "MALE_GENITALIA_EXPOSED": 0.55,
     "ANUS_EXPOSED": 0.55,
     "FEMALE_BREAST_EXPOSED": 0.60,
     "BUTTOCKS_EXPOSED": 0.65,
     # Additional Explicit & Borderline NSFW Classes (Balanced Limits)
-    "MALE_BREAST_EXPOSED": 0.72,
+    "MALE_BREAST_EXPOSED": 0.62,
     "FEMALE_GENITALIA_COVERED": 0.70,
-    "ANUS_COVERED": 0.70,
-    "FEMALE_BREAST_COVERED": 0.78,
-    "BUTTOCKS_COVERED": 0.78,
+    "ANUS_COVERED": 0.40,
+    "FEMALE_BREAST_COVERED": 0.68,
+    "BUTTOCKS_COVERED": 0.68,
 }
+
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN environment variable is missing!")
